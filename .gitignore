@@ -1,0 +1,11 @@
+# Input files (hours workbook, engineer_levels.xlsx) and Excel lock files
+*.xlsx
+*.xls
+
+# Generated reports
+reports/
+*.docx
+
+# Python
+__pycache__/
+*.pyc
