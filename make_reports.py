@@ -105,24 +105,29 @@ def find_columns(header_cells):
     return {k: v for k, v in found.items() if v is not None}
 
 
-def read_week_sheet(xls, sheet):
+def read_week_sheet(xls, sheet,
+                    needed=(COL_NAME, COL_SUPERVISOR, COL_ACTIVITY, COL_JIRA),
+                    optional=(), finder=find_columns):
     """
     Read a weekly sheet, finding the header row wherever it is.
+    `needed` columns must all be found; `optional` ones are kept if present.
+    `finder` maps a header row to {standard name: column index}.
     Returns (dataframe with standard column names, None) or (None, reason).
     """
     # keep_default_na=False: keep text like "N/A" or "NA" as it is written,
     # instead of pandas treating it as an empty cell
     raw = pd.read_excel(xls, sheet_name=sheet, header=None,
                         keep_default_na=False, na_values=[""])
-    needed = [COL_NAME, COL_SUPERVISOR, COL_ACTIVITY, COL_JIRA]
+    needed = list(needed)
     best = {}
     for i in range(min(60, len(raw))):
-        cols = find_columns(raw.iloc[i].tolist())
+        cols = finder(raw.iloc[i].tolist())
         if len(cols) > len(best):
             best = cols
         if all(k in cols for k in needed):
-            df = raw.iloc[i + 1:, [cols[k] for k in needed]].copy()
-            df.columns = needed
+            keep = needed + [k for k in optional if k in cols]
+            df = raw.iloc[i + 1:, [cols[k] for k in keep]].copy()
+            df.columns = keep
             return df.dropna(how="all"), None
 
     # Couldn't find it: explain what the sheet looks like so it can be fixed

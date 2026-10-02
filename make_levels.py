@@ -34,7 +34,9 @@ def collect_names(hours_path):
     xls = pd.ExcelFile(hours_path)
     people = {}
     for sheet in xls.sheet_names:
-        df, problem = read_week_sheet(xls, sheet)
+        # Only names and supervisors are needed, so this also works on the
+        # monthly workbook (which has no "Activity title" column)
+        df, problem = read_week_sheet(xls, sheet, needed=(COL_NAME, COL_SUPERVISOR))
         if df is None:
             print(f"  - Skipping sheet '{sheet}':\n      {problem}")
             continue
