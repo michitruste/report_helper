@@ -72,16 +72,69 @@ def load_levels(path):
     return levels
 
 
+def find_columns(header_cells):
+    """
+    Work out which column is which, tolerating small wording differences
+    (e.g. "Supervisor Name", "Engineer Name", "JIRA", "Activity Title ").
+    Returns {standard name: column index} for the columns it found.
+    """
+    found = {}
+    cells = [norm(c) for c in header_cells]
+
+    def first(match):
+        for idx, c in enumerate(cells):
+            if c and match(c):
+                return idx
+        return None
+
+    found[COL_SUPERVISOR] = first(lambda c: "supervisor" in c)
+    found[COL_JIRA] = first(lambda c: "jira" in c)
+    found[COL_ACTIVITY] = first(lambda c: "activity title" in c)
+    if found[COL_ACTIVITY] is None:
+        found[COL_ACTIVITY] = first(lambda c: "activity" in c
+                                    and "description" not in c
+                                    and "feature" not in c)
+    # Engineer name: an exact "Name" column first, otherwise e.g. "Engineer Name"
+    found[COL_NAME] = first(lambda c: c == "name")
+    if found[COL_NAME] is None:
+        others = ("supervisor", "program", "feature", "activity", "model")
+        found[COL_NAME] = first(lambda c: "name" in c
+                                and not any(o in c for o in others))
+    return {k: v for k, v in found.items() if v is not None}
+
+
 def read_week_sheet(xls, sheet):
-    """Read a weekly sheet, finding the header row even if it isn't row 1."""
-    raw = pd.read_excel(xls, sheet_name=sheet, header=None)
-    for i in range(min(15, len(raw))):
-        cells = [norm(v) for v in raw.iloc[i].tolist()]
-        if norm(COL_SUPERVISOR) in cells and norm(COL_NAME) in cells:
-            df = raw.iloc[i + 1:].copy()
-            df.columns = [clean(c) for c in raw.iloc[i].tolist()]
-            return df.dropna(how="all")
-    return None
+    """
+    Read a weekly sheet, finding the header row wherever it is.
+    Returns (dataframe with standard column names, None) or (None, reason).
+    """
+    # keep_default_na=False: keep text like "N/A" or "NA" as it is written,
+    # instead of pandas treating it as an empty cell
+    raw = pd.read_excel(xls, sheet_name=sheet, header=None,
+                        keep_default_na=False, na_values=[""])
+    needed = [COL_NAME, COL_SUPERVISOR, COL_ACTIVITY, COL_JIRA]
+    best = {}
+    for i in range(min(60, len(raw))):
+        cols = find_columns(raw.iloc[i].tolist())
+        if len(cols) > len(best):
+            best = cols
+        if all(k in cols for k in needed):
+            df = raw.iloc[i + 1:, [cols[k] for k in needed]].copy()
+            df.columns = needed
+            return df.dropna(how="all"), None
+
+    # Couldn't find it: explain what the sheet looks like so it can be fixed
+    lines = []
+    if best:
+        missing = [k for k in needed if k not in best]
+        lines.append(f"closest header row is missing: {missing}")
+    preview = raw.dropna(how="all").head(4)
+    for _, row in preview.iterrows():
+        vals = [clean(v) for v in row.tolist() if clean(v)]
+        lines.append("first rows look like: " + " | ".join(vals)[:150])
+    if raw.dropna(how="all").empty:
+        lines.append("the sheet appears to be empty")
+    return None, "\n      ".join(lines)
 
 
 def set_cell_shading(cell, hex_fill):
@@ -178,13 +231,9 @@ def main():
     unassigned = set()
 
     for sheet in xls.sheet_names:
-        df = read_week_sheet(xls, sheet)
+        df, problem = read_week_sheet(xls, sheet)
         if df is None:
-            print(f"  - Skipping sheet '{sheet}' (no Name/Supervisor header found)")
-            continue
-        missing = [c for c in (COL_ACTIVITY, COL_JIRA) if c not in df.columns]
-        if missing:
-            print(f"  - Skipping sheet '{sheet}' (missing columns: {missing})")
+            print(f"  - Skipping sheet '{sheet}':\n      {problem}")
             continue
         week_order.append(sheet)
 
