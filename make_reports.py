@@ -64,6 +64,8 @@ def load_levels(path):
     levels = {}
     for _, row in df.dropna(subset=["Name"]).iterrows():
         level = clean(row["Level"]).capitalize()
+        if not level:                 # not filled in yet - reported as "no level" later
+            continue
         if level not in LEVELS:
             print(f"  ! Unknown level '{row['Level']}' for {row['Name']} "
                   f"(use Basic, Intermediate or Senior) - ignored")
