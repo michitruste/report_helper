@@ -12,9 +12,9 @@ Creates ONE Word document per supervisor with:
       and a table with one row each for Basic / Intermediate / Senior
 
 Excel column               -> Word column
-    Feature name               -> Activity Title
+    Activity Description       -> Activity Title
     JIRA ID/Test Rail Test Run -> JIRA ID/TMT Request ID/Test Rail Test Run
-    Activity Description       -> Activity Description
+    TC executed, ...           -> Activity Description
     TC executed, ...           -> TC executed, ...
     Program                    -> Vehicle Program
     (none)                     -> Total Amount of hours (left blank for now)
@@ -60,14 +60,18 @@ TITLE_FILL = "F6C5AC"
 
 # Columns we need from the monthly sheet (plus Name / Supervisor / JIRA ID)
 COL_DATE = "Date"
-COL_FEATURE = "Feature name"
 COL_DESCRIPTION = "Activity Description"
 COL_TC = "TC executed"
 COL_PROGRAM = "Program"
-NEEDED = [COL_NAME, COL_SUPERVISOR, COL_FEATURE, COL_JIRA,
-          COL_DESCRIPTION, COL_TC, COL_PROGRAM]
-# What goes in the table, in order, after "Service Level"
-ENTRY_COLS = [COL_FEATURE, COL_JIRA, COL_DESCRIPTION, COL_TC, COL_PROGRAM]
+# Excel column feeding each Word column after "Service Level", in order
+# (None = left blank). Total Amount of hours is always blank.
+ENTRY_COLS = [COL_DESCRIPTION,   # -> Activity Title
+              COL_JIRA,          # -> JIRA ID/TMT Request ID/Test Rail Test Run
+              COL_TC,            # -> Activity Description
+              COL_TC,            # -> TC executed, ...
+              COL_PROGRAM]       # -> Vehicle Program
+# dict.fromkeys: each Excel column once, even if it feeds two Word columns
+NEEDED = list(dict.fromkeys([COL_NAME, COL_SUPERVISOR] + [c for c in ENTRY_COLS if c]))
 
 
 # ----------------------------------------------------------------- helpers
@@ -92,7 +96,6 @@ def find_columns(header_cells):
         COL_NAME: first(lambda c: c == "name",
                         lambda c: "name" in c and not any(o in c for o in others)),
         COL_SUPERVISOR: first(lambda c: "supervisor" in c),
-        COL_FEATURE: first(lambda c: "feature" in c),
         COL_JIRA: first(lambda c: "jira" in c),
         COL_DESCRIPTION: first(lambda c: "description" in c),
         COL_TC: first(lambda c: c.startswith("tc executed"),
@@ -161,8 +164,11 @@ def add_week(doc, supervisor, label, activities_by_level):
         items = activities_by_level.get(level, [])
         cells = table.add_row().cells
         write_cell(cells[0], level, bold=True, center=True)
-        for col in range(len(ENTRY_COLS)):
-            write_bullets(cells[col + 1], [item[col] for item in items])
+        for col, source in enumerate(ENTRY_COLS):
+            if source:
+                write_bullets(cells[col + 1], [item[col] for item in items])
+            else:
+                write_cell(cells[col + 1], "")
         write_cell(cells[-1], "")             # Total hours: left blank for now
 
     table.autofit = False
@@ -189,7 +195,7 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # data[supervisor][week key][level] = [(feature, jira, description, tc, program), ...]
+    # data[supervisor][week key][level] = [entry following ENTRY_COLS, ...]
     # week key: (0, monday ordinal) for dated rows, (1, sheet index) for undated sheets
     data, labels = {}, {}
     sunday_weeks = set()
@@ -213,7 +219,7 @@ def main():
             if level is None:
                 unassigned.add(name)
                 continue
-            entry = tuple(clean(row[c]) for c in ENTRY_COLS)
+            entry = tuple(clean(row[c]) if c else "" for c in ENTRY_COLS)
             if not any(entry):
                 continue
 
