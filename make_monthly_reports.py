@@ -8,7 +8,7 @@ Same idea as make_reports.py, for the monthly workbook layout:
 
 Creates ONE Word document per supervisor with:
     - the supervisor name in a shaded box at the top
-    - for every week: "Week 36 (September 1 – September 6):  - Supervisor: <name>"
+    - for every week: "Week 39: 01/09/2026 - 06/09/2026  - Supervisor: <name>"
       and a table with one row each for Basic / Intermediate / Senior
 
 Excel column               -> Word column
@@ -19,9 +19,12 @@ Excel column               -> Word column
     Program                    -> Vehicle Program
     (none)                     -> Total Amount of hours (left blank for now)
 
-Weeks come from the Date column (ISO week number, Monday to Saturday, or to
-Sunday if someone logged a Sunday). A sheet without a Date column is treated as
-one week named after the sheet, like in make_reports.py.
+Weeks come from the Date column, not from the sheet names: Monday to Sunday,
+cut at the start and end of the month (so September 2026 gives 01/09 - 06/09,
+07/09 - 13/09, ..., 28/09 - 30/09). Week numbers are ISO week numbers unless
+--first-week is given, which numbers the first week N and counts up from there.
+A sheet without a Date column is treated as one week named after the sheet,
+like in make_reports.py.
 
 Engineer levels come from the same engineer_levels.xlsx as make_reports.py
 (make_levels.py also works on the monthly workbook).
@@ -30,12 +33,14 @@ Usage:
     pip install pandas openpyxl python-docx
     python make_monthly_reports.py monthly.xlsx
     python make_monthly_reports.py monthly.xlsx --levels engineer_levels.xlsx --out monthly_reports
+    python make_monthly_reports.py monthly.xlsx --first-week 39
 """
 
 import argparse
+import calendar
 import re
 import sys
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -115,13 +120,12 @@ def to_date(value):
     return None if pd.isna(d) else d.date()
 
 
-def day(d):
-    return f"{d:%B} {d.day}"
-
-
-def week_label(monday, has_sunday):
-    end = monday + timedelta(days=6 if has_sunday else 5)
-    return f"Week {monday.isocalendar()[1]} ({day(monday)} – {day(end)})"
+def week_label(number, monday, year, month):
+    """"Week 39: 01/09/2026 - 06/09/2026" - Monday to Sunday, cut to the month."""
+    start = max(monday, date(year, month, 1))
+    end = min(monday + timedelta(days=6),
+              date(year, month, calendar.monthrange(year, month)[1]))
+    return f"Week {number}: {start:%d/%m/%Y} - {end:%d/%m/%Y}"
 
 
 # -------------------------------------------------------------- the page
@@ -148,7 +152,7 @@ def repeat_as_header(row):
 
 def add_week(doc, supervisor, label, activities_by_level):
     p = doc.add_paragraph(style="List Bullet")
-    p.add_run(f"{label}:  - ")
+    p.add_run(f"{label}  - ")
     p.add_run(f"Supervisor: {supervisor}").bold = True
 
     table = doc.add_table(rows=1, cols=len(HEADERS))
@@ -188,6 +192,9 @@ def main():
     ap.add_argument("--levels", default="engineer_levels.xlsx",
                     help="Excel file with columns Name | Level")
     ap.add_argument("--out", default="monthly_reports", help="Output folder")
+    ap.add_argument("--first-week", type=int,
+                    help="Number of the first week (e.g. 39); the rest count up "
+                         "from it. Default: ISO week numbers")
     args = ap.parse_args()
 
     levels = load_levels(args.levels)
@@ -196,9 +203,9 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # data[supervisor][week key][level] = [entry following ENTRY_COLS, ...]
-    # week key: (0, monday ordinal) for dated rows, (1, sheet index) for undated sheets
+    # week key: (0, monday ordinal, year, month) for dated rows - a week that
+    # runs into the next month is split in two - or (1, sheet index) for undated sheets
     data, labels = {}, {}
-    sunday_weeks = set()
     unassigned = set()
     bad_dates = 0
 
@@ -229,10 +236,8 @@ def main():
                     bad_dates += 1
                     continue
                 monday = d - timedelta(days=d.weekday())
-                week = (0, monday.toordinal())
+                week = (0, monday.toordinal(), d.year, d.month)
                 labels[week] = monday
-                if d.weekday() == 6:
-                    sunday_weeks.add(week)
             else:
                 week = (1, sheet_idx)
                 labels[week] = sheet
@@ -246,9 +251,14 @@ def main():
     if not data:
         sys.exit("No rows found. Check the sheet layout and the levels file.")
 
-    for week, value in labels.items():
+    first_monday = min((w[1] for w in labels if w[0] == 0), default=0)
+    for week, monday in labels.items():
         if week[0] == 0:
-            labels[week] = week_label(value, week in sunday_weeks)
+            if args.first_week is None:
+                number = monday.isocalendar()[1]
+            else:
+                number = args.first_week + (week[1] - first_monday) // 7
+            labels[week] = week_label(number, monday, week[2], week[3])
 
     for supervisor, weeks in data.items():
         doc = Document()
