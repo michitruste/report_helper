@@ -19,6 +19,10 @@ Excel column               -> Word column
     Program                    -> Vehicle Program
     (none)                     -> Total Amount of hours (left blank for now)
 
+A JIRA cell with several tickets ("ABC-1, ABC-2 and ABC-3") becomes one bullet
+per ticket, repeating the activity title and the other columns. If the title
+cell has as many titles as there are tickets, they are paired in order.
+
 Weeks come from the Date column, not from the sheet names: Monday to Sunday,
 cut at the start and end of the month (so September 2026 gives 01/09 - 06/09,
 07/09 - 13/09, ..., 28/09 - 30/09). Week numbers are ISO week numbers unless
@@ -45,15 +49,15 @@ from pathlib import Path
 
 import pandas as pd
 from docx import Document
-from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, Cm
+from docx.shared import Pt, Cm, RGBColor
 
 from make_reports import (LEVELS, COL_NAME, COL_SUPERVISOR, COL_JIRA,
                           norm, clean, load_levels, read_week_sheet,
-                          set_cell_shading, write_cell, write_bullets)
+                          set_cell_shading, write_cell)
 
 HEADERS = ["Service Level", "Activity Title",
            "JIRA ID/TMT Request ID/Test Rail Test Run", "Activity Description",
@@ -62,6 +66,7 @@ HEADERS = ["Service Level", "Activity Title",
            "Vehicle Program", "Total Amount of hours"]
 COL_WIDTHS = [Cm(2.6), Cm(3.1), Cm(2.5), Cm(2.6), Cm(3.1), Cm(2.6), Cm(2.0)]
 TITLE_FILL = "F6C5AC"
+SPLIT_COLOR = RGBColor(0xC0, 0x00, 0x00)   # items split from a multi-ticket cell
 
 # Columns we need from the monthly sheet (plus Name / Supervisor / JIRA ID)
 COL_DATE = "Date"
@@ -120,6 +125,48 @@ def to_date(value):
     return None if pd.isna(d) else d.date()
 
 
+TICKET_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*-\d+\b")       # ABC-123
+TICKET_SEP = re.compile(r"[\s,;&]+")
+TITLE_SEP = re.compile(r"\s*(?:[,;\n•&]|\s+and\s+|\s+y\s+)\s*", re.I)
+
+
+def split_tickets(text):
+    """
+    "ABC-1, ABC-2 and ABC-3" -> ["ABC-1", "ABC-2", "ABC-3"].
+    A single ticket, "N/A" or free text comes back as [text].
+    """
+    keys = list(dict.fromkeys(TICKET_RE.findall(text)))
+    if len(keys) > 1:
+        return keys
+    # Test Rail runs / plain numbers: "R1234 R1235", "12345, 12346"
+    parts = [p for p in TICKET_SEP.split(text) if p and p.lower() not in ("and", "y")]
+    if len(parts) > 1 and all(re.search(r"\d", p) for p in parts):
+        return list(dict.fromkeys(parts))
+    return [text]
+
+
+def split_entry(entry):
+    """
+    One Excel row -> one entry per ticket in its JIRA cell, the other columns
+    repeated. Several titles in the title cell are paired with the tickets in
+    order when the counts match; otherwise every ticket gets the whole title.
+    """
+    jira_i = ENTRY_COLS.index(COL_JIRA)
+    title_i = ENTRY_COLS.index(COL_DESCRIPTION)
+    tickets = split_tickets(entry[jira_i])
+    if len(tickets) == 1:
+        return [entry]
+    titles = [t for t in TITLE_SEP.split(entry[title_i]) if t]
+    if len(titles) != len(tickets):
+        titles = [entry[title_i]] * len(tickets)
+    parts = []
+    for title, ticket in zip(titles, tickets):
+        part = list(entry)
+        part[title_i], part[jira_i] = title, ticket
+        parts.append(tuple(part))
+    return parts
+
+
 def week_label(number, monday, year, month):
     """"Week 39: 01/09/2026 - 06/09/2026" - Monday to Sunday, cut to the month."""
     start = max(monday, date(year, month, 1))
@@ -150,6 +197,27 @@ def repeat_as_header(row):
     tr_pr.append(OxmlElement("w:tblHeader"))
 
 
+def write_numbered(cell, lines, flagged):
+    """
+    Write the lines as 1., 2., 3. ... inside one table cell (numbering starts
+    at 1 in every cell, so item N lines up across the columns). Lines whose
+    flag is set (split from a cell with several tickets) are red and bold.
+    """
+    cell.text = ""
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+    for i, (text, flag) in enumerate(zip(lines, flagged)):
+        p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+        p.paragraph_format.left_indent = Cm(0.5)
+        p.paragraph_format.first_line_indent = Cm(-0.5)
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        run = p.add_run(f"{i + 1}.\t{text or '-'}")
+        run.font.size = Pt(10)
+        if flag:
+            run.bold = True
+            run.font.color.rgb = SPLIT_COLOR
+
+
 def add_week(doc, supervisor, label, activities_by_level):
     p = doc.add_paragraph(style="List Bullet")
     p.add_run(f"{label}  - ")
@@ -163,14 +231,15 @@ def add_week(doc, supervisor, label, activities_by_level):
         write_cell(table.rows[0].cells[i], h)
     repeat_as_header(table.rows[0])
 
-    # One row per level; each column a bullet list, one bullet per activity
+    # One row per level; each column a numbered list, one item per activity
     for level in LEVELS:
-        items = activities_by_level.get(level, [])
+        items = activities_by_level.get(level, {})
+        flagged = list(items.values())
         cells = table.add_row().cells
         write_cell(cells[0], level, bold=True, center=True)
         for col, source in enumerate(ENTRY_COLS):
             if source:
-                write_bullets(cells[col + 1], [item[col] for item in items])
+                write_numbered(cells[col + 1], [item[col] for item in items], flagged)
             else:
                 write_cell(cells[col + 1], "")
         write_cell(cells[-1], "")             # Total hours: left blank for now
@@ -202,7 +271,9 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # data[supervisor][week key][level] = [entry following ENTRY_COLS, ...]
+    # data[supervisor][week key][level] = {entry following ENTRY_COLS: split?, ...}
+    # (a dict keeps the entries unique and in order; split? = came from a cell
+    # with several tickets, shown in red)
     # week key: (0, monday ordinal, year, month) for dated rows - a week that
     # runs into the next month is split in two - or (1, sheet index) for undated sheets
     data, labels = {}, {}
@@ -244,9 +315,10 @@ def main():
 
             bucket = (data.setdefault(supervisor, {})
                           .setdefault(week, {})
-                          .setdefault(level, []))
-            if entry not in bucket:          # same activity on several days -> once
-                bucket.append(entry)
+                          .setdefault(level, {}))
+            parts = split_entry(entry)       # several tickets in one cell -> one each
+            for part in parts:               # same activity on several days -> once
+                bucket[part] = bucket.get(part, False) or len(parts) > 1
 
     if not data:
         sys.exit("No rows found. Check the sheet layout and the levels file.")
