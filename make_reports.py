@@ -11,6 +11,10 @@ workbook, e.g. "Aug 10 to 16") becomes ONE page with:
 Engineer levels come from a small Excel file you maintain by hand
 (engineer_levels.xlsx with columns: Name | Level).
 
+The columns, the words used to find them and the Word table can be changed
+in the window (report_gui.pyw); this script uses the default "Weekly" layout.
+The logic lives in report_engine.py.
+
 Usage:
     pip install pandas openpyxl python-docx
     python make_reports.py hours.xlsx
@@ -18,260 +22,11 @@ Usage:
 """
 
 import argparse
-import re
 import sys
-from pathlib import Path
 
-import pandas as pd
-from docx import Document
-from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Pt, Cm
-
-LEVELS = ["Basic", "Intermediate", "Senior"]
-HEADERS = ["Service level", "Activity title", "JIRA ID", "Total hours"]
-COL_WIDTHS = [Cm(3.5), Cm(7.5), Cm(3.5), Cm(2.5)]
-
-# Columns we need from each weekly sheet
-COL_NAME = "Name"
-COL_SUPERVISOR = "Supervisor"
-COL_ACTIVITY = "Activity title"
-COL_JIRA = "JIRA ID"
+from report_engine import ReportError, build_reports, default_profile
 
 
-# ----------------------------------------------------------------- helpers
-def norm(text):
-    """Normalise a name for matching: trim, collapse spaces, ignore case."""
-    return re.sub(r"\s+", " ", str(text)).strip().lower()
-
-
-def clean(value):
-    """Turn Excel values into display text (blank for empty cells)."""
-    if pd.isna(value):
-        return ""
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
-    return str(value).strip()
-
-
-def load_levels(path):
-    df = pd.read_excel(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    if "Name" not in df.columns or "Level" not in df.columns:
-        sys.exit(f"'{path}' must have the columns 'Name' and 'Level'.")
-    levels = {}
-    for _, row in df.dropna(subset=["Name"]).iterrows():
-        level = clean(row["Level"]).capitalize()
-        if not level:                 # not filled in yet - reported as "no level" later
-            continue
-        if level not in LEVELS:
-            print(f"  ! Unknown level '{row['Level']}' for {row['Name']} "
-                  f"(use Basic, Intermediate or Senior) - ignored")
-            continue
-        levels[norm(row["Name"])] = level
-    return levels
-
-
-def load_roster(path):
-    """Every engineer in the levels file, as written there: {norm(name): name}."""
-    df = pd.read_excel(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    return {norm(n): clean(n) for n in df["Name"].dropna() if clean(n)}
-
-
-def report_missing(weeks, uploaded, roster):
-    """
-    Print, week by week, the engineers who didn't upload any activity.
-    weeks:    [(week key, label), ...] in order
-    uploaded: {week key: {norm(name), ...}}
-    roster:   {norm(name): name} - everyone expected to upload
-    """
-    missing = []
-    for week, label in weeks:
-        names = [roster[n] for n in roster if n not in uploaded.get(week, set())]
-        if names:
-            missing.append((label, sorted(names, key=str.lower)))
-    if not missing:
-        print("\n  ✓ Every engineer uploaded activities every week.")
-        return
-    print("\n  ! These engineers didn't upload any activities:")
-    for label, names in missing:
-        print(f"      {label}")
-        for n in names:
-            print(f"          - {n}")
-
-
-def find_columns(header_cells):
-    """
-    Work out which column is which, tolerating small wording differences
-    (e.g. "Supervisor Name", "Engineer Name", "JIRA", "Activity Title ").
-    Returns {standard name: column index} for the columns it found.
-    """
-    found = {}
-    cells = [norm(c) for c in header_cells]
-
-    def first(match):
-        for idx, c in enumerate(cells):
-            if c and match(c):
-                return idx
-        return None
-
-    found[COL_SUPERVISOR] = first(lambda c: "supervisor" in c)
-    found[COL_JIRA] = first(lambda c: "jira" in c)
-    found[COL_ACTIVITY] = first(lambda c: "activity title" in c)
-    if found[COL_ACTIVITY] is None:
-        found[COL_ACTIVITY] = first(lambda c: "activity" in c
-                                    and "description" not in c
-                                    and "feature" not in c)
-    # Engineer name: an exact "Name" column first, otherwise e.g. "Engineer Name"
-    found[COL_NAME] = first(lambda c: c == "name")
-    if found[COL_NAME] is None:
-        others = ("supervisor", "program", "feature", "activity", "model")
-        found[COL_NAME] = first(lambda c: "name" in c
-                                and not any(o in c for o in others))
-    return {k: v for k, v in found.items() if v is not None}
-
-
-def read_week_sheet(xls, sheet,
-                    needed=(COL_NAME, COL_SUPERVISOR, COL_ACTIVITY, COL_JIRA),
-                    optional=(), finder=find_columns):
-    """
-    Read a weekly sheet, finding the header row wherever it is.
-    `needed` columns must all be found; `optional` ones are kept if present.
-    `finder` maps a header row to {standard name: column index}.
-    Returns (dataframe with standard column names, None) or (None, reason).
-    """
-    # keep_default_na=False: keep text like "N/A" or "NA" as it is written,
-    # instead of pandas treating it as an empty cell
-    raw = pd.read_excel(xls, sheet_name=sheet, header=None,
-                        keep_default_na=False, na_values=[""])
-    needed = list(needed)
-    best = {}
-    for i in range(min(60, len(raw))):
-        cols = finder(raw.iloc[i].tolist())
-        if len(cols) > len(best):
-            best = cols
-        if all(k in cols for k in needed):
-            keep = needed + [k for k in optional if k in cols]
-            df = raw.iloc[i + 1:, [cols[k] for k in keep]].copy()
-            df.columns = keep
-            return df.dropna(how="all"), None
-
-    # Couldn't find it: explain what the sheet looks like so it can be fixed
-    lines = []
-    if best:
-        missing = [k for k in needed if k not in best]
-        lines.append(f"closest header row is missing: {missing}")
-    preview = raw.dropna(how="all").head(4)
-    for _, row in preview.iterrows():
-        vals = [clean(v) for v in row.tolist() if clean(v)]
-        lines.append("first rows look like: " + " | ".join(vals)[:150])
-    if raw.dropna(how="all").empty:
-        lines.append("the sheet appears to be empty")
-    return None, "\n      ".join(lines)
-
-
-def set_cell_shading(cell, hex_fill):
-    tc_pr = cell._tc.get_or_add_tcPr()
-    shd = OxmlElement("w:shd")
-    shd.set(qn("w:val"), "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"), hex_fill)
-    tc_pr.append(shd)
-
-
-def format_table_paragraph(p):
-    """
-    Table text: 10 pt, 0 pt before / after, single line spacing. The paragraph
-    mark gets 10 pt as well, so empty cells and bullet symbols aren't 11 pt.
-    """
-    pf = p.paragraph_format
-    pf.space_before = Pt(0)
-    pf.space_after = Pt(0)
-    pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
-    p_pr = p._p.get_or_add_pPr()
-    r_pr = p_pr.find(qn("w:rPr"))
-    if r_pr is None:
-        r_pr = OxmlElement("w:rPr")
-        p_pr.append(r_pr)
-    for tag in ("w:sz", "w:szCs"):
-        sz = r_pr.find(qn(tag))
-        if sz is None:
-            sz = OxmlElement(tag)
-            r_pr.append(sz)
-        sz.set(qn("w:val"), "20")             # half-points: 20 = 10 pt
-
-
-def write_cell(cell, text, bold=False, center=False):
-    cell.text = ""
-    p = cell.paragraphs[0]
-    format_table_paragraph(p)
-    run = p.add_run(text)
-    run.bold = bold
-    run.font.size = Pt(10)
-    if center:
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-
-
-def write_bullets(cell, lines):
-    """Write each line as a bullet point inside a single table cell."""
-    cell.text = ""
-    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
-    format_table_paragraph(cell.paragraphs[0])    # also when there are no lines
-    for i, text in enumerate(lines):
-        p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
-        p.style = "List Bullet"
-        format_table_paragraph(p)
-        run = p.add_run(text or "-")   # keep the bullets of both columns lined up
-        run.font.size = Pt(10)
-
-
-# -------------------------------------------------------------- the page
-def add_week_page(doc, supervisor, week, activities_by_level, first_page):
-    if not first_page:
-        doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
-
-    title = doc.add_paragraph()
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = title.add_run(supervisor)
-    r.bold = True
-    r.font.size = Pt(16)
-
-    wk = doc.add_paragraph()
-    wk.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = wk.add_run(f"Week: {week}")
-    r.font.size = Pt(12)
-
-    table = doc.add_table(rows=1, cols=len(HEADERS))
-    table.style = "Table Grid"
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-    for i, h in enumerate(HEADERS):
-        cell = table.rows[0].cells[i]
-        write_cell(cell, h, bold=True, center=True)
-        set_cell_shading(cell, "D9E2F3")
-
-    # One row per level; activities and JIRA IDs as bullet lists in one cell
-    for level in LEVELS:
-        items = activities_by_level.get(level, [])
-        cells = table.add_row().cells
-        write_cell(cells[0], level, bold=True, center=True)
-        write_bullets(cells[1], [a for a, _ in items])
-        write_bullets(cells[2], [j for _, j in items])
-        write_cell(cells[3], "")              # Total hours: left blank for now
-
-    table.autofit = False
-    for i, w in enumerate(COL_WIDTHS):
-        table.columns[i].width = w
-    for row in table.rows:
-        for i, w in enumerate(COL_WIDTHS):
-            row.cells[i].width = w
-
-
-# ------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="Build weekly supervisor reports.")
     ap.add_argument("hours", help="Excel workbook with one sheet per week")
@@ -280,76 +35,12 @@ def main():
     ap.add_argument("--out", default="reports", help="Output folder")
     args = ap.parse_args()
 
-    levels = load_levels(args.levels)
-    xls = pd.ExcelFile(args.hours)
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # data[supervisor][week][level] = [(activity, jira), ...]  (unique, in order)
-    data, week_order = {}, []
-    unassigned = set()
-    roster = load_roster(args.levels)       # + everyone found in the workbook
-    uploaded = {}                           # uploaded[week] = {norm(name), ...}
-
-    for sheet in xls.sheet_names:
-        df, problem = read_week_sheet(xls, sheet)
-        if df is None:
-            print(f"  - Skipping sheet '{sheet}':\n      {problem}")
-            continue
-        week_order.append(sheet)
-
-        for _, row in df.iterrows():
-            supervisor = clean(row[COL_SUPERVISOR])
-            name = clean(row[COL_NAME])
-            if not name:
-                continue
-            roster.setdefault(norm(name), name)
-            entry = (clean(row[COL_ACTIVITY]), clean(row[COL_JIRA]))
-            if any(entry):
-                uploaded.setdefault(sheet, set()).add(norm(name))
-            if not supervisor:
-                continue
-            level = levels.get(norm(name))
-            if level is None:
-                unassigned.add(name)
-                continue
-            if not any(entry):
-                continue
-            bucket = (data.setdefault(supervisor, {})
-                          .setdefault(sheet, {})
-                          .setdefault(level, []))
-            if entry not in bucket:          # same activity on several days -> once
-                bucket.append(entry)
-
-    if not data:
-        sys.exit("No rows found. Check the sheet layout and the levels file.")
-
-    for supervisor, weeks in data.items():
-        doc = Document()
-        for section in doc.sections:
-            section.top_margin = section.bottom_margin = Cm(2)
-            section.left_margin = section.right_margin = Cm(2)
-        style = doc.styles["Normal"]
-        style.font.name = "Calibri"
-        style.font.size = Pt(11)
-
-        first = True
-        for week in week_order:
-            if week in weeks:
-                add_week_page(doc, supervisor, week, weeks[week], first)
-                first = False
-
-        safe = re.sub(r'[\\/:*?"<>|]+', "_", supervisor)
-        path = out_dir / f"Report - {safe}.docx"
-        doc.save(path)
-        print(f"  ✓ {path}  ({len(weeks)} week(s))")
-
-    if unassigned:
-        print("\n  ! These engineers have no level in the levels file and were left out:")
-        for n in sorted(unassigned):
-            print(f"      - {n}")
-        print("    Add them to the levels file and run again.")
-    report_missing([(w, w) for w in week_order], uploaded, roster)
+    profile = default_profile("Weekly")
+    profile.update(hours_file=args.hours, levels_file=args.levels, out_dir=args.out)
+    try:
+        build_reports(profile)
+    except ReportError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":

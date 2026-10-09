@@ -29,6 +29,10 @@ like in make_reports.py.
 Engineer levels come from the same engineer_levels.xlsx as make_reports.py
 (make_levels.py also works on the monthly workbook).
 
+The columns, the words used to find them and the Word table can be changed
+in the window (report_gui.pyw); this script uses the default "Monthly" layout.
+The logic lives in report_engine.py.
+
 Usage:
     pip install pandas openpyxl python-docx
     python make_monthly_reports.py monthly.xlsx
@@ -37,155 +41,11 @@ Usage:
 """
 
 import argparse
-import calendar
-import re
 import sys
-from datetime import date, timedelta
-from pathlib import Path
 
-import pandas as pd
-from docx import Document
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Pt, Cm
-
-from make_reports import (LEVELS, COL_NAME, COL_SUPERVISOR, COL_JIRA,
-                          norm, clean, load_levels, load_roster, report_missing,
-                          read_week_sheet, set_cell_shading, write_cell, write_bullets)
-
-HEADERS = ["Service Level", "Activity Title",
-           "JIRA ID/TMT Request ID/Test Rail Test Run", "Activity Description",
-           "TC executed, TC created/Updated, System Issues Retested/Reported, "
-           "Test Procedure issues resolved, Deliverables completed",
-           "Vehicle Program", "Total Amount of hours"]
-COL_WIDTHS = [Cm(2.6), Cm(3.1), Cm(2.5), Cm(2.6), Cm(3.1), Cm(2.6), Cm(2.0)]
-TITLE_FILL = "F6C5AC"
-
-# Columns we need from the monthly sheet (plus Name / Supervisor / JIRA ID)
-COL_DATE = "Date"
-COL_DESCRIPTION = "Activity Description"
-COL_TC = "TC executed"
-COL_PROGRAM = "Program"
-# Excel column feeding each Word column after "Service Level", in order
-# (None = left blank). Total Amount of hours is always blank.
-ENTRY_COLS = [COL_DESCRIPTION,   # -> Activity Title
-              COL_JIRA,          # -> JIRA ID/TMT Request ID/Test Rail Test Run
-              COL_TC,            # -> Activity Description
-              COL_TC,            # -> TC executed, ...
-              COL_PROGRAM]       # -> Vehicle Program
-# dict.fromkeys: each Excel column once, even if it feeds two Word columns
-NEEDED = list(dict.fromkeys([COL_NAME, COL_SUPERVISOR] + [c for c in ENTRY_COLS if c]))
+from report_engine import ReportError, build_reports, default_profile
 
 
-# ----------------------------------------------------------------- helpers
-def find_columns(header_cells):
-    """
-    Work out which column is which in the monthly layout, tolerating small
-    wording differences. Returns {standard name: column index}.
-    """
-    cells = [norm(c) for c in header_cells]
-
-    def first(*matches):
-        for match in matches:                  # try the strictest match first
-            for idx, c in enumerate(cells):
-                if c and match(c):
-                    return idx
-        return None
-
-    others = ("supervisor", "program", "feature", "activity", "model")
-    found = {
-        # \b so "TC created/Updated" doesn't count as a date column
-        COL_DATE: first(lambda c: c == "date", lambda c: re.search(r"\bdate\b", c)),
-        COL_NAME: first(lambda c: c == "name",
-                        lambda c: "name" in c and not any(o in c for o in others)),
-        COL_SUPERVISOR: first(lambda c: "supervisor" in c),
-        COL_JIRA: first(lambda c: "jira" in c),
-        COL_DESCRIPTION: first(lambda c: "description" in c),
-        COL_TC: first(lambda c: c.startswith("tc executed"),
-                      lambda c: "tc executed" in c),
-        COL_PROGRAM: first(lambda c: c == "program", lambda c: "program" in c),
-    }
-    return {k: v for k, v in found.items() if v is not None}
-
-
-def to_date(value):
-    """Excel date cell (or text / serial number) -> date, or None."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if pd.isna(value):
-            return None
-        value = pd.Timestamp("1899-12-30") + pd.Timedelta(days=value)
-    d = pd.to_datetime(value, errors="coerce")
-    return None if pd.isna(d) else d.date()
-
-
-def week_label(number, monday, year, month):
-    """"Week 39: 01/09/2026 - 06/09/2026" - Monday to Sunday, cut to the month."""
-    start = max(monday, date(year, month, 1))
-    end = min(monday + timedelta(days=6),
-              date(year, month, calendar.monthrange(year, month)[1]))
-    return f"Week {number}: {start:%d/%m/%Y} - {end:%d/%m/%Y}"
-
-
-# -------------------------------------------------------------- the page
-def add_title_box(doc, supervisor):
-    box = doc.add_table(rows=1, cols=1)
-    box.style = "Table Grid"
-    box.alignment = WD_TABLE_ALIGNMENT.CENTER
-    cell = box.rows[0].cells[0]
-    cell.width = Cm(13.75)
-    set_cell_shading(cell, TITLE_FILL)
-    p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = p.add_run(supervisor)
-    r.font.name = "Calibri Light"
-    r.font.size = Pt(16)
-    doc.add_paragraph()
-
-
-def repeat_as_header(row):
-    """Repeat this row at the top of every page the table runs onto."""
-    tr_pr = row._tr.get_or_add_trPr()
-    tr_pr.append(OxmlElement("w:tblHeader"))
-
-
-def add_week(doc, supervisor, label, activities_by_level):
-    p = doc.add_paragraph(style="List Bullet")
-    p.add_run(f"{label}  - ")
-    p.add_run(f"Supervisor: {supervisor}").bold = True
-
-    table = doc.add_table(rows=1, cols=len(HEADERS))
-    table.style = "Table Grid"
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-    for i, h in enumerate(HEADERS):
-        write_cell(table.rows[0].cells[i], h)
-    repeat_as_header(table.rows[0])
-
-    # One row per level; each column a bullet list, one bullet per activity
-    for level in LEVELS:
-        items = activities_by_level.get(level, [])
-        cells = table.add_row().cells
-        write_cell(cells[0], level, bold=True, center=True)
-        for col, source in enumerate(ENTRY_COLS):
-            if source:
-                write_bullets(cells[col + 1], [item[col] for item in items])
-            else:
-                write_cell(cells[col + 1], "")
-        write_cell(cells[-1], "")             # Total hours: left blank for now
-
-    table.autofit = False
-    for i, w in enumerate(COL_WIDTHS):
-        table.columns[i].width = w
-    for row in table.rows:
-        for i, w in enumerate(COL_WIDTHS):
-            row.cells[i].width = w
-
-    doc.add_paragraph()
-
-
-# ------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="Build monthly supervisor reports.")
     ap.add_argument("hours", help="Monthly Excel workbook")
@@ -197,106 +57,13 @@ def main():
                          "from it. Default: ISO week numbers")
     args = ap.parse_args()
 
-    levels = load_levels(args.levels)
-    xls = pd.ExcelFile(args.hours)
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # data[supervisor][week key][level] = [entry following ENTRY_COLS, ...]
-    # week key: (0, monday ordinal, year, month) for dated rows - a week that
-    # runs into the next month is split in two - or (1, sheet index) for undated sheets
-    data, labels = {}, {}
-    unassigned = set()
-    bad_dates = 0
-    roster = load_roster(args.levels)       # + everyone found in the workbook
-    uploaded = {}                           # uploaded[week key] = {norm(name), ...}
-
-    for sheet_idx, sheet in enumerate(xls.sheet_names):
-        df, problem = read_week_sheet(xls, sheet, needed=NEEDED,
-                                      optional=[COL_DATE], finder=find_columns)
-        if df is None:
-            print(f"  - Skipping sheet '{sheet}':\n      {problem}")
-            continue
-        dated = COL_DATE in df.columns
-
-        for _, row in df.iterrows():
-            supervisor = clean(row[COL_SUPERVISOR])
-            name = clean(row[COL_NAME])
-            if not name:
-                continue
-            roster.setdefault(norm(name), name)
-            entry = tuple(clean(row[c]) if c else "" for c in ENTRY_COLS)
-
-            week = None
-            if any(entry):
-                if not dated:
-                    week = (1, sheet_idx)
-                elif (d := to_date(row[COL_DATE])) is not None:
-                    monday = d - timedelta(days=d.weekday())
-                    week = (0, monday.toordinal(), d.year, d.month)
-                if week:
-                    uploaded.setdefault(week, set()).add(norm(name))
-
-            if not supervisor:
-                continue
-            level = levels.get(norm(name))
-            if level is None:
-                unassigned.add(name)
-                continue
-            if not any(entry):
-                continue
-            if week is None:
-                bad_dates += 1
-                continue
-            labels[week] = date.fromordinal(week[1]) if week[0] == 0 else sheet
-
-            bucket = (data.setdefault(supervisor, {})
-                          .setdefault(week, {})
-                          .setdefault(level, []))
-            if entry not in bucket:          # same activity on several days -> once
-                bucket.append(entry)
-
-    if not data:
-        sys.exit("No rows found. Check the sheet layout and the levels file.")
-
-    first_monday = min((w[1] for w in labels if w[0] == 0), default=0)
-    for week, monday in labels.items():
-        if week[0] == 0:
-            if args.first_week is None:
-                number = monday.isocalendar()[1]
-            else:
-                number = args.first_week + (week[1] - first_monday) // 7
-            labels[week] = week_label(number, monday, week[2], week[3])
-
-    for supervisor, weeks in data.items():
-        doc = Document()
-        for section in doc.sections:
-            section.top_margin = section.bottom_margin = Cm(2.5)
-            section.left_margin = section.right_margin = Cm(1.5)
-        style = doc.styles["Normal"]
-        style.font.name = "Times New Roman"
-        style.font.size = Pt(11)
-
-        add_title_box(doc, supervisor)
-        for week in sorted(weeks):
-            add_week(doc, supervisor, labels[week], weeks[week])
-
-        safe = re.sub(r'[\\/:*?"<>|]+', "_", supervisor)
-        path = out_dir / f"Monthly Report - {safe}.docx"
-        try:
-            doc.save(path)
-        except PermissionError:
-            sys.exit(f"Can't write '{path}' - close it in Word and run again.")
-        print(f"  ✓ {path}  ({len(weeks)} week(s))")
-
-    if bad_dates:
-        print(f"\n  ! {bad_dates} row(s) had an empty or unreadable Date and were left out.")
-    if unassigned:
-        print("\n  ! These engineers have no level in the levels file and were left out:")
-        for n in sorted(unassigned):
-            print(f"      - {n}")
-        print("    Add them to the levels file (python make_levels.py <workbook>) and run again.")
-    report_missing([(w, labels[w]) for w in sorted(labels)], uploaded, roster)
+    profile = default_profile("Monthly")
+    profile.update(hours_file=args.hours, levels_file=args.levels,
+                   out_dir=args.out, first_week=args.first_week)
+    try:
+        build_reports(profile)
+    except ReportError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":

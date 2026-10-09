@@ -9,6 +9,9 @@ Senior dropdown).
 If the levels file already exists, levels you already filled in are kept and
 only new names are added, so it's safe to run again every week.
 
+The window (report_gui.pyw) runs this with its own settings
+("Create / update levels file"); this script uses the default ones.
+
 Usage:
     pip install pandas openpyxl
     python make_levels.py hours.xlsx
@@ -25,27 +28,31 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from make_reports import (LEVELS, COL_NAME, COL_SUPERVISOR,
-                          norm, clean, read_week_sheet)
+from report_engine import (LEVELS, NAME, SUPERVISOR, ReportError, active_fields,
+                           clean, default_profile, make_finder, norm,
+                           open_workbook, read_week_sheet)
 
 
-def collect_names(hours_path):
+def collect_names(hours_path, profile, log=print):
     """Return {normalised name: (spelling, [supervisors])} from every sheet."""
-    xls = pd.ExcelFile(hours_path)
+    xls = open_workbook(hours_path)
+    # Only names and supervisors are needed, so this works on any workbook
+    fields = [f for f in active_fields(profile) if f["name"] in (NAME, SUPERVISOR)]
+    needed = [f["name"] for f in fields]
+    finder = make_finder(fields)
+    fixed = profile["supervisor_mode"] == "fixed"
     people = {}
     for sheet in xls.sheet_names:
-        # Only names and supervisors are needed, so this also works on the
-        # monthly workbook (which has no "Activity title" column)
-        df, problem = read_week_sheet(xls, sheet, needed=(COL_NAME, COL_SUPERVISOR))
+        df, problem = read_week_sheet(xls, sheet, needed, finder=finder)
         if df is None:
-            print(f"  - Skipping sheet '{sheet}':\n      {problem}")
+            log(f"  - Skipping sheet '{sheet}':\n      {problem}")
             continue
         for _, row in df.iterrows():
-            name = clean(row[COL_NAME])
+            name = clean(row[NAME])
             if not name:
                 continue
             spelling, supervisors = people.setdefault(norm(name), (" ".join(name.split()), []))
-            supervisor = clean(row[COL_SUPERVISOR])
+            supervisor = profile["supervisor_name"].strip() if fixed else clean(row[SUPERVISOR])
             if supervisor and supervisor not in supervisors:
                 supervisors.append(supervisor)
     return people
@@ -55,17 +62,20 @@ def read_existing(path):
     """Return {normalised name: (spelling, level)} from an existing levels file."""
     if not path.exists():
         return {}
-    df = pd.read_excel(path)
+    try:
+        df = pd.read_excel(path)
+    except PermissionError:
+        raise ReportError(f"Can't open '{path}' - close it in Excel and try again.")
     df.columns = [str(c).strip() for c in df.columns]
     if "Name" not in df.columns or "Level" not in df.columns:
-        sys.exit(f"'{path}' must have the columns 'Name' and 'Level'.")
+        raise ReportError(f"'{path}' must have the columns 'Name' and 'Level'.")
     existing = {}
     for _, row in df.dropna(subset=["Name"]).iterrows():
         existing[norm(row["Name"])] = (clean(row["Name"]), clean(row["Level"]))
     return existing
 
 
-def warn_similar(names):
+def warn_similar(names, log=print):
     """Point out names that look like typos of each other (e.g. Jon / John)."""
     names = sorted(names, key=str.lower)
     lowered = [n.lower() for n in names]
@@ -75,9 +85,9 @@ def warn_similar(names):
             if difflib.SequenceMatcher(None, a, lowered[j]).ratio() >= 0.85:
                 pairs.append((names[i], names[j]))
     if pairs:
-        print("\n  ! These names look very similar - check the hours file for typos:")
+        log("\n  ! These names look very similar - check the hours file for typos:")
         for a, b in pairs:
-            print(f"      - '{a}'  vs  '{b}'")
+            log(f"      - '{a}'  vs  '{b}'")
 
 
 def write_levels(path, rows):
@@ -107,20 +117,15 @@ def write_levels(path, rows):
     try:
         wb.save(path)
     except PermissionError:
-        sys.exit(f"Can't write '{path}' - close it in Excel and run again.")
+        raise ReportError(f"Can't write '{path}' - close it in Excel and try again.")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Create/update the engineer levels file.")
-    ap.add_argument("hours", help="Excel workbook with one sheet per week")
-    ap.add_argument("--levels", default="engineer_levels.xlsx",
-                    help="Levels file to create or update (Name | Level)")
-    args = ap.parse_args()
-
-    levels_path = Path(args.levels)
-    people = collect_names(args.hours)
+def update_levels(hours_path, levels_path, profile, log=print):
+    """Create / update the levels file from the names in the hours workbook."""
+    levels_path = Path(levels_path)
+    people = collect_names(hours_path, profile, log)
     if not people:
-        sys.exit("No engineer names found. Check the sheet layout.")
+        raise ReportError("No engineer names found. Check the sheet layout.")
     existing = read_existing(levels_path)
 
     rows, new, missing_level = [], [], []
@@ -142,15 +147,27 @@ def main():
     rows.sort(key=lambda r: r[0].lower())
     write_levels(levels_path, rows)
 
-    print(f"  ✓ {levels_path}  ({len(rows)} engineer(s), {len(new)} new)")
+    log(f"  ✓ {levels_path}  ({len(rows)} engineer(s), {len(new)} new)")
     if new and existing:
-        print("\n  New names added:")
+        log("\n  New names added:")
         for n in sorted(new, key=str.lower):
-            print(f"      - {n}")
+            log(f"      - {n}")
     if missing_level:
-        print(f"\n  ! {len(missing_level)} engineer(s) still need a level - "
-              f"open {levels_path.name} and fill in the Level column.")
-    warn_similar([s for s, _ in people.values()])
+        log(f"\n  ! {len(missing_level)} engineer(s) still need a level - "
+            f"open {levels_path.name} and fill in the Level column.")
+    warn_similar([s for s, _ in people.values()], log)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Create/update the engineer levels file.")
+    ap.add_argument("hours", help="Excel workbook with one sheet per week")
+    ap.add_argument("--levels", default="engineer_levels.xlsx",
+                    help="Levels file to create or update (Name | Level)")
+    args = ap.parse_args()
+    try:
+        update_levels(args.hours, args.levels, default_profile("Weekly"))
+    except ReportError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":

@@ -9,3 +9,6 @@ reports/
 # Python
 __pycache__/
 *.pyc
+
+# Window settings (local file paths)
+report_settings.json
