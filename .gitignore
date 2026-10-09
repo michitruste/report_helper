@@ -12,3 +12,8 @@ __pycache__/
 
 # Window settings (local file paths)
 report_settings.json
+
+# Virtual environments
+.venv/
+venv/
+env/

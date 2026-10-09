@@ -33,12 +33,31 @@ try:
     import report_engine as eng
     import make_levels
 except ImportError as e:
+    # Double-clicking starts the main Python, not a virtual environment. If
+    # there is one next to this file (or one folder up), restart with it.
+    if not os.environ.get("REPORT_HELPER_RELAUNCHED"):
+        import subprocess
+        for folder in (HERE, HERE.parent):
+            for venv in (".venv", "venv", "env"):
+                for exe in ("Scripts/pythonw.exe", "Scripts/python.exe", "bin/python"):
+                    candidate = folder / venv / exe
+                    if candidate.exists() and candidate.resolve() != Path(sys.executable).resolve():
+                        subprocess.Popen([str(candidate), str(Path(__file__).resolve())],
+                                         env={**os.environ, "REPORT_HELPER_RELAUNCHED": "1"})
+                        sys.exit(0)
+    # Otherwise say which Python is running and how to install into exactly that one
     _root = tk.Tk()
     _root.withdraw()
+    package = {"docx": "python-docx"}.get(e.name, e.name)
     messagebox.showerror("Report Helper",
-                         f"A Python package is missing: {e.name}\n\n"
-                         "Install the packages with:\n"
-                         "    pip install pandas openpyxl python-docx")
+                         f"The package '{package}' is missing in this Python:\n"
+                         f"    {sys.executable}\n\n"
+                         "Install the packages into it with:\n"
+                         f'    "{sys.executable}" -m pip install pandas openpyxl python-docx\n\n'
+                         "If the packages are in a virtual environment, put it in this "
+                         "folder as '.venv' or 'venv' (it is then used automatically), "
+                         "or start the window from it:\n"
+                         r"    <venv>\Scripts\python report_gui.pyw")
     sys.exit(1)
 
 LAYOUTS = {"weekly": "One page per week (weekly report)",
