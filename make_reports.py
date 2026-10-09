@@ -25,7 +25,7 @@ from pathlib import Path
 import pandas as pd
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, Cm
@@ -72,6 +72,35 @@ def load_levels(path):
             continue
         levels[norm(row["Name"])] = level
     return levels
+
+
+def load_roster(path):
+    """Every engineer in the levels file, as written there: {norm(name): name}."""
+    df = pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    return {norm(n): clean(n) for n in df["Name"].dropna() if clean(n)}
+
+
+def report_missing(weeks, uploaded, roster):
+    """
+    Print, week by week, the engineers who didn't upload any activity.
+    weeks:    [(week key, label), ...] in order
+    uploaded: {week key: {norm(name), ...}}
+    roster:   {norm(name): name} - everyone expected to upload
+    """
+    missing = []
+    for week, label in weeks:
+        names = [roster[n] for n in roster if n not in uploaded.get(week, set())]
+        if names:
+            missing.append((label, sorted(names, key=str.lower)))
+    if not missing:
+        print("\n  ✓ Every engineer uploaded activities every week.")
+        return
+    print("\n  ! These engineers didn't upload any activities:")
+    for label, names in missing:
+        print(f"      {label}")
+        for n in names:
+            print(f"          - {n}")
 
 
 def find_columns(header_cells):
@@ -153,9 +182,32 @@ def set_cell_shading(cell, hex_fill):
     tc_pr.append(shd)
 
 
+def format_table_paragraph(p):
+    """
+    Table text: 10 pt, 0 pt before / after, single line spacing. The paragraph
+    mark gets 10 pt as well, so empty cells and bullet symbols aren't 11 pt.
+    """
+    pf = p.paragraph_format
+    pf.space_before = Pt(0)
+    pf.space_after = Pt(0)
+    pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+    p_pr = p._p.get_or_add_pPr()
+    r_pr = p_pr.find(qn("w:rPr"))
+    if r_pr is None:
+        r_pr = OxmlElement("w:rPr")
+        p_pr.append(r_pr)
+    for tag in ("w:sz", "w:szCs"):
+        sz = r_pr.find(qn(tag))
+        if sz is None:
+            sz = OxmlElement(tag)
+            r_pr.append(sz)
+        sz.set(qn("w:val"), "20")             # half-points: 20 = 10 pt
+
+
 def write_cell(cell, text, bold=False, center=False):
     cell.text = ""
     p = cell.paragraphs[0]
+    format_table_paragraph(p)
     run = p.add_run(text)
     run.bold = bold
     run.font.size = Pt(10)
@@ -168,11 +220,11 @@ def write_bullets(cell, lines):
     """Write each line as a bullet point inside a single table cell."""
     cell.text = ""
     cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+    format_table_paragraph(cell.paragraphs[0])    # also when there are no lines
     for i, text in enumerate(lines):
         p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
         p.style = "List Bullet"
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.space_after = Pt(0)
+        format_table_paragraph(p)
         run = p.add_run(text or "-")   # keep the bullets of both columns lined up
         run.font.size = Pt(10)
 
@@ -236,6 +288,8 @@ def main():
     # data[supervisor][week][level] = [(activity, jira), ...]  (unique, in order)
     data, week_order = {}, []
     unassigned = set()
+    roster = load_roster(args.levels)       # + everyone found in the workbook
+    uploaded = {}                           # uploaded[week] = {norm(name), ...}
 
     for sheet in xls.sheet_names:
         df, problem = read_week_sheet(xls, sheet)
@@ -247,13 +301,18 @@ def main():
         for _, row in df.iterrows():
             supervisor = clean(row[COL_SUPERVISOR])
             name = clean(row[COL_NAME])
-            if not supervisor or not name:
+            if not name:
+                continue
+            roster.setdefault(norm(name), name)
+            entry = (clean(row[COL_ACTIVITY]), clean(row[COL_JIRA]))
+            if any(entry):
+                uploaded.setdefault(sheet, set()).add(norm(name))
+            if not supervisor:
                 continue
             level = levels.get(norm(name))
             if level is None:
                 unassigned.add(name)
                 continue
-            entry = (clean(row[COL_ACTIVITY]), clean(row[COL_JIRA]))
             if not any(entry):
                 continue
             bucket = (data.setdefault(supervisor, {})
@@ -290,6 +349,7 @@ def main():
         for n in sorted(unassigned):
             print(f"      - {n}")
         print("    Add them to the levels file and run again.")
+    report_missing([(w, w) for w in week_order], uploaded, roster)
 
 
 if __name__ == "__main__":
