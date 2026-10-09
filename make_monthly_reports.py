@@ -52,8 +52,8 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, Cm
 
 from make_reports import (LEVELS, COL_NAME, COL_SUPERVISOR, COL_JIRA,
-                          norm, clean, load_levels, read_week_sheet,
-                          set_cell_shading, write_cell, write_bullets)
+                          norm, clean, load_levels, load_roster, report_missing,
+                          read_week_sheet, set_cell_shading, write_cell, write_bullets)
 
 HEADERS = ["Service Level", "Activity Title",
            "JIRA ID/TMT Request ID/Test Rail Test Run", "Activity Description",
@@ -208,6 +208,8 @@ def main():
     data, labels = {}, {}
     unassigned = set()
     bad_dates = 0
+    roster = load_roster(args.levels)       # + everyone found in the workbook
+    uploaded = {}                           # uploaded[week key] = {norm(name), ...}
 
     for sheet_idx, sheet in enumerate(xls.sheet_names):
         df, problem = read_week_sheet(xls, sheet, needed=NEEDED,
@@ -220,27 +222,33 @@ def main():
         for _, row in df.iterrows():
             supervisor = clean(row[COL_SUPERVISOR])
             name = clean(row[COL_NAME])
-            if not supervisor or not name:
+            if not name:
+                continue
+            roster.setdefault(norm(name), name)
+            entry = tuple(clean(row[c]) if c else "" for c in ENTRY_COLS)
+
+            week = None
+            if any(entry):
+                if not dated:
+                    week = (1, sheet_idx)
+                elif (d := to_date(row[COL_DATE])) is not None:
+                    monday = d - timedelta(days=d.weekday())
+                    week = (0, monday.toordinal(), d.year, d.month)
+                if week:
+                    uploaded.setdefault(week, set()).add(norm(name))
+
+            if not supervisor:
                 continue
             level = levels.get(norm(name))
             if level is None:
                 unassigned.add(name)
                 continue
-            entry = tuple(clean(row[c]) if c else "" for c in ENTRY_COLS)
             if not any(entry):
                 continue
-
-            if dated:
-                d = to_date(row[COL_DATE])
-                if d is None:
-                    bad_dates += 1
-                    continue
-                monday = d - timedelta(days=d.weekday())
-                week = (0, monday.toordinal(), d.year, d.month)
-                labels[week] = monday
-            else:
-                week = (1, sheet_idx)
-                labels[week] = sheet
+            if week is None:
+                bad_dates += 1
+                continue
+            labels[week] = date.fromordinal(week[1]) if week[0] == 0 else sheet
 
             bucket = (data.setdefault(supervisor, {})
                           .setdefault(week, {})
@@ -288,6 +296,7 @@ def main():
         for n in sorted(unassigned):
             print(f"      - {n}")
         print("    Add them to the levels file (python make_levels.py <workbook>) and run again.")
+    report_missing([(w, labels[w]) for w in sorted(labels)], uploaded, roster)
 
 
 if __name__ == "__main__":
